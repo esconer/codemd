@@ -1,0 +1,1523 @@
+#!/usr/bin/env bash
+#
+# codemd - export a Git repository to a single Markdown file.
+#
+# Files are discovered from Git (tracked + untracked, honouring .gitignore),
+# filtered by the rules below, and written as fenced Markdown code blocks.
+# Every excluded path is reported both on the console and in a table at the
+# end of the generated Markdown file. The header also reports the total
+# character count and an estimated token count (English prose, ~4 chars/token).
+#
+# Run `./codemd --help` for all options.
+
+set -o pipefail
+
+VERSION="1.0.0"
+
+# Resolve the script location. The repository root defaults to the script's
+# directory, just like the original convert-markdown.sh.
+SCRIPT_PATH="$(realpath -m -- "${BASH_SOURCE[0]}")"
+DEFAULT_ROOT="$(dirname -- "$SCRIPT_PATH")"
+SELF_NAME="$(basename -- "$SCRIPT_PATH")"
+
+ROOT_DIR="$DEFAULT_ROOT"
+OUTPUT_FILE="Content.md"
+OUTPUT_OPTION_GIVEN=0
+INCLUDE_IGNORED=0
+EXPAND_IGNORED=0
+MAX_LIST=0
+WRITE_EXCLUDED_SECTION=1
+PRINT_FILES=1
+WRITE_HEADER=1
+PROFILE_LLM=0
+REPORT_FILE=""
+REPORT_ABS=""
+REPORT_REL=""
+MANIFEST=0
+DIFF_ONLY=0
+WITH_DIFF=0
+CHANGED_ONLY=0
+DIFF_BASE="HEAD"
+CHANGED_BASE="HEAD"
+WITH_DIFF_BASE="HEAD"
+BUDGET_TOKENS=0
+SPLIT_CHARS=0
+TO_IMAGES=0
+IMAGE_WIDTH=1800
+IMAGE_HEIGHT=4096
+IMAGE_FONT_SIZE=20
+IMAGE_THEME="light"
+IMAGE_OUTDIR=""
+CURRENT_PART=1
+TOTAL_PARTS=1
+SPLIT_CHUNKS=()
+PART_PATHS=()
+PART_CHARS=()
+PART_TOKENS=()
+FILES_PATTERNS=()
+GLOB_PATTERNS=()
+DELETED_FILES=()
+MODE_DESC=""
+SELECTION_DESC=""
+DIFF_DESC=""
+declare -A CHANGED_SET=()
+declare -A NOISE_SEEN=()
+
+# Directories that are always reported as a single entry instead of listing
+# every file inside them. Add more with `--collapse`.
+COLLAPSE_PATTERNS=()
+
+# -----------------------------------------------------------------------------
+# Rules: extra patterns, files, or folders to ignore (in addition to
+# .gitignore). Supports wildcards (*), filenames, and directory names.
+#
+# This is the same list from convert-markdown.sh. Uncomment entries you want
+# to exclude, or pass additional patterns with `-e/--exclude`.
+# -----------------------------------------------------------------------------
+EXTRA_IGNORES=(
+    "$OUTPUT_FILE"
+    "convert-markdown.sh"
+    ".fallow"
+    # ".github"
+    # ".husky"
+    ".vscode"
+    "public"
+    "capabilities"
+    "bin"
+    "gen"
+    "icons"
+    "bun.lock"
+    "Cargo.lock"
+    ".gitattributes"
+    ".gitignore"
+    "Dockerfile"
+    "LICENSE"
+    "nginx.conf"
+    # "index.html"
+    # "tsconfig.*"
+    "env*"
+    # "commitlint.config.ts"
+    # "vite.config.ts"
+    # ".editorconfig"
+    # ".oxlintrc.json.bak"
+    # "prettier.config.js"
+    "vitest.config.ts"
+    # "README.md"
+    # "AGENTS.md"
+    # "weights"
+    # "models.json"
+    # "smoke_test.json"
+    # "build.sh"
+    # "static"
+    # "commands"
+    # "registry"
+    # "scripts"
+    # "skills"
+    # "tasks"
+    # "lefthook.yml"
+    # "CHANGELOG.md"
+    # "package.json"
+    # "Cargo.toml"
+)
+
+usage() {
+    cat <<EOF
+codemd $VERSION - export a Git repository to a single Markdown file
+
+Usage:
+  $SELF_NAME [OPTIONS]
+
+Options:
+  -C, --root DIR          Repository root (default: directory of this script)
+  -o, --output FILE       Output Markdown file (default: Content.md)
+  -e, --exclude PATTERN   Extra ignore pattern (repeatable, adds to the rules)
+      --exclude-from FILE  Read extra ignore patterns from FILE, one per line
+      --include-ignored   Also export files ignored by .gitignore
+      --expand-ignored    List every ignored file (no collapsing at all)
+      --max-list N        Collapse ignored dirs with more than N files (0 = no limit, default)
+      --collapse PATTERN  Collapse a directory name matching PATTERN to one line
+      --no-excluded       Do not write the "Excluded files" table to the output
+      --no-header         Do not write the top-level header to the output
+
+Selection and LLM helpers (opt-in; the default full export is unchanged):
+      --manifest          Write a file manifest (no code) instead of an export
+      --files PATH        Export only PATH (repeatable; exact files bypass .gitignore)
+      --glob PATTERN      Export only files matching PATTERN (repeatable)
+      --changed [BASE]    Export only files changed vs BASE (default: HEAD)
+      --diff [BASE]       Export only a unified diff vs BASE (default: HEAD)
+      --with-diff [BASE]  Add a unified diff vs BASE to a full export
+      --budget N          Skip files that would exceed ~N estimated tokens
+      --split-chars N     Split output into ~N-character parts (part1, part2, ...)
+      --to-images         Render parts to PNG images (experimental; needs Pillow)
+      --image-width PX    Image width in pixels (default: 1800)
+      --image-height PX   Image height in pixels (default: 4096)
+      --image-font-size N Monospace font size (default: 20)
+      --image-theme light|dark   Image colour theme (default: light)
+      --image-outdir DIR  Where to write images (default: with each part)
+      --profile llm       Skip lockfiles, licenses, wrappers, and generated assets
+      --report FILE       Write the exclusion report to FILE (omitted from payload)
+
+  -q, --quiet             Do not print individual included/excluded paths
+  -h, --help              Show this help
+      --version           Show the version
+
+Examples:
+  $SELF_NAME
+  $SELF_NAME -o export.md
+  $SELF_NAME -e "*.lock" -e "fixtures"
+  $SELF_NAME --exclude-from .codemdignore
+  $SELF_NAME --include-ignored
+  $SELF_NAME --changed
+  $SELF_NAME --diff HEAD~1
+  $SELF_NAME --files crates/protocol/src/wire.rs --files crates/host-engine/src/lib.rs
+  $SELF_NAME --glob 'crates/protocol/*' --budget 64000
+  $SELF_NAME --split-chars 100000 --report Content.report.md
+  $SELF_NAME --split-chars 20000 --to-images --report Content.report.md
+  $SELF_NAME --profile llm --report Content.report.md
+  $SELF_NAME --manifest -o REPOMAP.md
+EOF
+}
+
+die() {
+    printf 'codemd: %s\n' "$*" >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+while (( $# > 0 )); do
+    case "$1" in
+        -C|--root)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            ROOT_DIR="$2"
+            shift 2
+            ;;
+        -o|--output)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            OUTPUT_FILE="$2"
+            shift 2
+            ;;
+        -e|--exclude)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            EXTRA_IGNORES+=("$2")
+            shift 2
+            ;;
+        --exclude-from)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            [[ -r "$2" ]] || die "cannot read exclude file '$2'"
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                line="${line#"${line%%[![:space:]]*}"}"
+                line="${line%"${line##*[![:space:]]}"}"
+                [[ -z "$line" || "$line" == \#* ]] && continue
+                EXTRA_IGNORES+=("$line")
+            done < "$2"
+            shift 2
+            ;;
+        --include-ignored)
+            INCLUDE_IGNORED=1
+            shift
+            ;;
+        --expand-ignored)
+            EXPAND_IGNORED=1
+            MAX_LIST=0
+            shift
+            ;;
+        --max-list)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            [[ "$2" =~ ^[0-9]+$ ]] || die "--max-list expects a non-negative integer"
+            MAX_LIST="$2"
+            shift 2
+            ;;
+        --collapse)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            COLLAPSE_PATTERNS+=("$2")
+            shift 2
+            ;;
+        --no-excluded)
+            WRITE_EXCLUDED_SECTION=0
+            shift
+            ;;
+        --no-header)
+            WRITE_HEADER=0
+            shift
+            ;;
+        --manifest)
+            MANIFEST=1
+            shift
+            ;;
+        --files)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            [[ -n "$2" ]] || die "option '$1' requires a non-empty value"
+            FILES_PATTERNS+=("$2")
+            shift 2
+            ;;
+        --glob)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            [[ -n "$2" ]] || die "option '$1' requires a non-empty value"
+            GLOB_PATTERNS+=("$2")
+            shift 2
+            ;;
+        --changed|--changed=*)
+            if [[ "$1" == *=* ]]; then
+                CHANGED_BASE="${1#*=}"
+            elif (( $# >= 2 )) && [[ "$2" != -* ]]; then
+                CHANGED_BASE="$2"
+                shift
+            fi
+            CHANGED_ONLY=1
+            shift
+            ;;
+        --diff|--diff=*)
+            if [[ "$1" == *=* ]]; then
+                DIFF_BASE="${1#*=}"
+            elif (( $# >= 2 )) && [[ "$2" != -* ]]; then
+                DIFF_BASE="$2"
+                shift
+            fi
+            DIFF_ONLY=1
+            shift
+            ;;
+        --with-diff|--with-diff=*)
+            if [[ "$1" == *=* ]]; then
+                WITH_DIFF_BASE="${1#*=}"
+            elif (( $# >= 2 )) && [[ "$2" != -* ]]; then
+                WITH_DIFF_BASE="$2"
+                shift
+            fi
+            WITH_DIFF=1
+            shift
+            ;;
+        --budget)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            [[ "$2" =~ ^[0-9]+$ ]] || die "--budget expects a non-negative integer"
+            BUDGET_TOKENS="$2"
+            shift 2
+            ;;
+        --split-chars)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            [[ "$2" =~ ^[0-9]+$ ]] && (( $2 > 0 )) ||
+                die "--split-chars expects a positive integer"
+            SPLIT_CHARS="$2"
+            shift 2
+            ;;
+        --to-images)
+            TO_IMAGES=1
+            shift
+            ;;
+        --image-width)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            [[ "$2" =~ ^[0-9]+$ ]] || die "--image-width expects a positive integer"
+            IMAGE_WIDTH="$2"
+            shift 2
+            ;;
+        --image-height)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            [[ "$2" =~ ^[0-9]+$ ]] || die "--image-height expects a positive integer"
+            IMAGE_HEIGHT="$2"
+            shift 2
+            ;;
+        --image-font-size)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            [[ "$2" =~ ^[0-9]+$ ]] || die "--image-font-size expects a positive integer"
+            IMAGE_FONT_SIZE="$2"
+            shift 2
+            ;;
+        --image-theme)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            case "$2" in
+                light|dark) IMAGE_THEME="$2" ;;
+                *) die "unknown image theme '$2' (supported: light, dark)" ;;
+            esac
+            shift 2
+            ;;
+        --image-outdir)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            IMAGE_OUTDIR="$2"
+            shift 2
+            ;;
+        --profile)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            case "$2" in
+                llm) PROFILE_LLM=1 ;;
+                *)   die "unknown profile '$2' (supported: llm)" ;;
+            esac
+            shift 2
+            ;;
+        --report)
+            (( $# >= 2 )) || die "option '$1' requires a value"
+            [[ -n "$2" ]] || die "option '$1' requires a non-empty value"
+            REPORT_FILE="$2"
+            shift 2
+            ;;
+        -q|--quiet)
+            PRINT_FILES=0
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --version)
+            printf 'codemd %s\n' "$VERSION"
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            die "unknown option '$1' (see --help)"
+            ;;
+    esac
+done
+
+(( $# == 0 )) || die "unexpected argument '$1' (see --help)"
+
+[[ -n "$DIFF_BASE" ]] || die "--diff base cannot be empty"
+[[ -n "$CHANGED_BASE" ]] || die "--changed base cannot be empty"
+[[ -n "$WITH_DIFF_BASE" ]] || die "--with-diff base cannot be empty"
+
+if (( MANIFEST )); then
+    (( ! DIFF_ONLY && ! WITH_DIFF )) || die "--manifest cannot be combined with --diff/--with-diff"
+    (( BUDGET_TOKENS == 0 )) || die "--manifest does not use --budget"
+    (( SPLIT_CHARS == 0 )) || die "--manifest does not use --split-chars"
+fi
+if (( TO_IMAGES )); then
+    if (( SPLIT_CHARS == 0 )); then
+        SPLIT_CHARS=20000
+        printf 'codemd: --to-images with no --split-chars; using --split-chars 20000\n'
+    fi
+fi
+if (( DIFF_ONLY )); then
+    (( ! WITH_DIFF )) || die "--diff and --with-diff cannot be combined"
+    (( ! CHANGED_ONLY )) || die "--diff and --changed cannot be combined"
+    (( ${#FILES_PATTERNS[@]} == 0 )) || die "--diff cannot be combined with --files"
+    (( ${#GLOB_PATTERNS[@]} == 0 )) || die "--diff cannot be combined with --glob"
+    (( BUDGET_TOKENS == 0 )) || die "--diff does not use --budget"
+fi
+if (( WITH_DIFF )); then
+    (( ${#FILES_PATTERNS[@]} == 0 )) || die "--with-diff cannot be combined with --files"
+    (( ${#GLOB_PATTERNS[@]} == 0 )) || die "--with-diff cannot be combined with --glob"
+fi
+if (( CHANGED_ONLY )); then
+    (( ${#FILES_PATTERNS[@]} == 0 )) || die "--changed cannot be combined with --files"
+    (( ${#GLOB_PATTERNS[@]} == 0 )) || die "--changed cannot be combined with --glob"
+fi
+
+# ---------------------------------------------------------------------------
+# Resolve root and output paths
+# ---------------------------------------------------------------------------
+[[ -d "$ROOT_DIR" ]] || die "root directory '$ROOT_DIR' does not exist"
+[[ -n "$OUTPUT_FILE" ]] || die "output file cannot be empty"
+ROOT_DIR="$(realpath -m -- "$ROOT_DIR")" || die "cannot resolve root directory"
+cd "$ROOT_DIR" || die "cannot change directory to '$ROOT_DIR'"
+
+case "$OUTPUT_FILE" in
+    /*) OUTPUT_ABS="$(realpath -m -- "$OUTPUT_FILE")" ;;
+    *)  OUTPUT_ABS="$(realpath -m -- "$ROOT_DIR/$OUTPUT_FILE")" ;;
+esac
+[[ -n "$OUTPUT_ABS" ]] || die "cannot resolve output path"
+mkdir -p -- "$(dirname -- "$OUTPUT_ABS")" || die "cannot create output directory"
+
+# Relative form of the output file (for matching against git paths).
+OUTPUT_REL=""
+case "$OUTPUT_ABS" in
+    "$ROOT_DIR"/*) OUTPUT_REL="${OUTPUT_ABS#"$ROOT_DIR"/}" ;;
+esac
+
+# Generated part files must not be exported on a later run.
+if (( SPLIT_CHARS > 0 )); then
+    split_base="${OUTPUT_FILE##*/}"
+    if [[ "$split_base" == *.* ]]; then
+        EXTRA_IGNORES+=("${split_base%.*}.part*")
+    else
+        EXTRA_IGNORES+=("${split_base}.part*")
+    fi
+fi
+if (( TO_IMAGES )); then
+    image_base="${OUTPUT_FILE##*/}"
+    image_base="${image_base%.*}"
+    EXTRA_IGNORES+=("${image_base}.p*.png" "${image_base}.part*.png")
+fi
+
+if [[ -n "$REPORT_FILE" ]]; then
+    case "$REPORT_FILE" in
+        /*) REPORT_ABS="$(realpath -m -- "$REPORT_FILE")" ;;
+        *)  REPORT_ABS="$(realpath -m -- "$ROOT_DIR/$REPORT_FILE")" ;;
+    esac
+    [[ -n "$REPORT_ABS" ]] || die "cannot resolve report path"
+    [[ "$REPORT_ABS" != "$OUTPUT_ABS" ]] || die "--report must be different from --output"
+    mkdir -p -- "$(dirname -- "$REPORT_ABS")" || die "cannot create report directory"
+    REPORT_REL=""
+    case "$REPORT_ABS" in
+        "$ROOT_DIR"/*) REPORT_REL="${REPORT_ABS#"$ROOT_DIR"/}" ;;
+    esac
+fi
+
+SELF_REL=""
+case "$SCRIPT_PATH" in
+    "$ROOT_DIR"/*) SELF_REL="${SCRIPT_PATH#"$ROOT_DIR"/}" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Git discovery
+# ---------------------------------------------------------------------------
+command -v git >/dev/null 2>&1 || die "git is required"
+command -v file >/dev/null 2>&1 || die "the 'file' utility is required"
+if (( TO_IMAGES )); then
+    command -v python3 >/dev/null 2>&1 || die "python3 is required for --to-images"
+    [[ -f "$DEFAULT_ROOT/codemd_images.py" ]] || die "codemd_images.py not found next to codemd"
+fi
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    die "'$ROOT_DIR' is not inside a Git repository (needed to honour .gitignore)"
+fi
+
+# Tracked + untracked files, minus .gitignore'd paths (unless --include-ignored).
+mapfile -d '' -t ALL_FILES < <(
+    if (( INCLUDE_IGNORED )); then
+        git ls-files -z --cached --others
+    else
+        git ls-files -z --cached --others --exclude-standard
+    fi | sort -z
+)
+
+# Ignored paths. Whole ignored directories are collapsed to one entry unless
+# --expand-ignored was requested.
+GIT_IGNORED=()
+if (( ! INCLUDE_IGNORED )); then
+    if (( EXPAND_IGNORED )); then
+        mapfile -d '' -t GIT_IGNORED < <(
+            git ls-files -z --others --ignored --exclude-standard | sort -z
+        )
+    else
+        mapfile -d '' -t GIT_IGNORED < <(
+            git ls-files -z --others --ignored --exclude-standard --directory | sort -z
+        )
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Return the first EXTRA_IGNORES pattern matching the given path, else non-zero.
+extra_ignore_match() {
+    local file="$1"
+    local filename pattern
+    filename="$(basename -- "$file")"
+
+    for pattern in "${EXTRA_IGNORES[@]}"; do
+        [[ -z "$pattern" ]] && continue
+        # Match the full path, the basename, a directory prefix, or any subpath.
+        # (Right-hand side is intentionally unquoted for glob matching.)
+        if [[ "$file" == $pattern ]] ||
+           [[ "$filename" == $pattern ]] ||
+           [[ "$file" == $pattern/* ]] ||
+           [[ "$file" == */$pattern/* ]] ||
+           [[ "$file" == */$pattern ]]; then
+            printf '%s' "$pattern"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Directory names that are dependency/build output, never project source.
+# These are collapsed to one line in the report instead of listing thousands
+# of files. Use --collapse for extra names, or --expand-ignored to disable.
+is_noise_name() {
+    local name="$1" pattern
+
+    for pattern in "${COLLAPSE_PATTERNS[@]}"; do
+        [[ "$name" == $pattern ]] && return 0
+    done
+
+    case "$name" in
+        node_modules|bower_components|jspm_packages|\
+        target|vendor|dist|build|obj|coverage|\
+        .git|.hg|.svn|.gradle|.cargo|.pkgconfig|\
+        .idea|.vscode|.vs|.next|.nuxt|.svelte-kit|.angular|\
+        .turbo|.parcel-cache|.yarn|.pnpm-store|.npm|\
+        .venv|venv|__pycache__|site-packages|\
+        .tox|.mypy_cache|.pytest_cache|.ruff_cache|.cache|\
+        Pods|DerivedData|.dart_tool|.pub-cache|.stack-work|\
+        .terraform|.serverless|.expo)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+# Files that add little to an LLM code review. Only used by --profile llm.
+profile_skip_reason() {
+    local file="$1" base
+    base="$(basename -- "$file")"
+
+    case "$base" in
+        Cargo.lock|package-lock.json|yarn.lock|pnpm-lock.yaml|bun.lock|bun.lockb|\
+        Gemfile.lock|poetry.lock|Pipfile.lock|composer.lock|flake.lock|go.sum|\
+        gradle.lockfile|*.lock)
+            printf 'lockfile (--profile llm)'
+            return 0
+            ;;
+        LICENSE|LICENSE.*|LICENSE-*|COPYING|COPYING.*|COPYING-*|\
+        NOTICE|NOTICE.*|NOTICE-*|PATENTS|\
+        THIRD_PARTY*|third-party*|third_party*)
+            printf 'license/notice (--profile llm)'
+            return 0
+            ;;
+        CHANGELOG*|CHANGES*|HISTORY*|AUTHORS*|CONTRIBUTORS*)
+            printf 'changelog/credits (--profile llm)'
+            return 0
+            ;;
+        gradlew|gradlew.bat|mvnw|mvnw.cmd)
+            printf 'generated wrapper script (--profile llm)'
+            return 0
+            ;;
+        *.min.js|*.min.css|*.map|*.svg|*.ico|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.pdf|\
+        *.pb.go|*_pb2.py|*.generated.*|*.g.dart|*.freezed.dart)
+            printf 'generated asset (--profile llm)'
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+# Return the first path component that is dependency/build noise, if any.
+noise_root_for() {
+    local rest="${1%/}" prefix="" part
+    while [[ -n "$rest" ]]; do
+        part="${rest%%/*}"
+        if [[ "$rest" == */* ]]; then
+            rest="${rest#*/}"
+        else
+            rest=""
+        fi
+        prefix="${prefix:+$prefix/}$part"
+        if is_noise_name "$part"; then
+            printf '%s' "$prefix"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Record a noise directory once, no matter how many files it contains.
+record_noise_dir() {
+    local dir="${1%/}" reason="$2"
+    [[ -n "${NOISE_SEEN[$dir]:-}" ]] && return
+    NOISE_SEEN[$dir]=1
+    record_excluded "$dir/" "$reason [collapsed directory]"
+}
+
+# Record a single excluded path, collapsing it into a noise directory when it
+# lives under one. This is what keeps node_modules/target out of the report.
+record_path() {
+    local path="$1" reason="$2" noise
+    if (( ! EXPAND_IGNORED )); then
+        if noise="$(noise_root_for "$path")"; then
+            record_noise_dir "$noise" "$reason"
+            return
+        fi
+    fi
+    record_excluded "$path" "$reason"
+}
+
+# Text files only. Empty files count as text; UTF-16/32 is treated as binary
+# because pasting it into a UTF-8 Markdown file is not useful.
+is_text_file() {
+    local file="$1" encoding
+    [[ -s "$file" ]] || return 0
+    encoding="$(file -b --mime-encoding -- "$file" 2>/dev/null)" || return 1
+    case "$encoding" in
+        binary|utf-16*|utf-32*|unknown-16*|unknown-32*) return 1 ;;
+    esac
+    return 0
+}
+
+# Map a filename to a Markdown code-fence language tag.
+language_for() {
+    local base ext
+    base="$(basename -- "$1")"
+
+    case "$base" in
+        Dockerfile|Containerfile|*.Dockerfile) printf 'dockerfile'; return ;;
+        Makefile|makefile|GNUmakefile)         printf 'makefile';   return ;;
+        CMakeLists.txt)                        printf 'cmake';      return ;;
+        Justfile|justfile)                     printf 'just';       return ;;
+        Cargo.lock)                            printf 'toml';       return ;;
+        package-lock.json)                     printf 'json';       return ;;
+        .gitignore|.gitattributes|.dockerignore|.npmignore|.prettierignore|.eslintignore)
+                                               printf 'gitignore';  return ;;
+        .editorconfig)                         printf 'ini';        return ;;
+        .env|.env.*)                           printf 'dotenv';     return ;;
+    esac
+
+    ext="${base##*.}"
+    [[ "$ext" == "$base" ]] && { printf 'text'; return; }
+
+    case "$ext" in
+        rs)                       printf 'rust' ;;
+        kt|kts)                   printf 'kotlin' ;;
+        java)                     printf 'java' ;;
+        gradle)                   printf 'groovy' ;;
+        py|pyi)                   printf 'python' ;;
+        rb)                       printf 'ruby' ;;
+        php)                      printf 'php' ;;
+        go)                       printf 'go' ;;
+        c|h)                      printf 'c' ;;
+        cc|cpp|cxx|hpp|hh|hxx)    printf 'cpp' ;;
+        cs)                       printf 'csharp' ;;
+        swift)                    printf 'swift' ;;
+        m|mm)                     printf 'objectivec' ;;
+        scala)                    printf 'scala' ;;
+        clj|cljs|cljc)            printf 'clojure' ;;
+        ex|exs)                   printf 'elixir' ;;
+        erl|hrl)                  printf 'erlang' ;;
+        hs)                       printf 'haskell' ;;
+        lua)                      printf 'lua' ;;
+        pl|pm)                    printf 'perl' ;;
+        r)                        printf 'r' ;;
+        dart)                     printf 'dart' ;;
+        zig)                      printf 'zig' ;;
+        nim)                      printf 'nim' ;;
+        jl)                       printf 'julia' ;;
+        sol)                      printf 'solidity' ;;
+        asm|s)                    printf 'asm' ;;
+        tf|tfvars)                printf 'hcl' ;;
+        nix)                      printf 'nix' ;;
+        cmake)                    printf 'cmake' ;;
+        mk)                       printf 'makefile' ;;
+        sh|bash)                  printf 'bash' ;;
+        zsh)                      printf 'zsh' ;;
+        fish)                     printf 'fish' ;;
+        ps1|psm1)                 printf 'powershell' ;;
+        bat|cmd)                  printf 'batch' ;;
+        js|mjs|cjs)               printf 'javascript' ;;
+        jsx)                      printf 'jsx' ;;
+        ts|mts|cts)               printf 'typescript' ;;
+        tsx)                      printf 'tsx' ;;
+        vue)                      printf 'vue' ;;
+        svelte)                   printf 'svelte' ;;
+        html|htm)                 printf 'html' ;;
+        css)                      printf 'css' ;;
+        scss)                     printf 'scss' ;;
+        sass)                     printf 'sass' ;;
+        less)                     printf 'less' ;;
+        xml|svg|plist)            printf 'xml' ;;
+        json|jsonc|json5)         printf 'json' ;;
+        yml|yaml)                 printf 'yaml' ;;
+        toml)                     printf 'toml' ;;
+        ini|cfg|conf|properties)  printf 'ini' ;;
+        sql)                      printf 'sql' ;;
+        proto)                    printf 'protobuf' ;;
+        graphql|gql)              printf 'graphql' ;;
+        md|markdown)              printf 'markdown' ;;
+        rst)                      printf 'rst' ;;
+        tex)                      printf 'latex' ;;
+        diff|patch)               printf 'diff' ;;
+        csv)                      printf 'csv' ;;
+        tsv)                      printf 'tsv' ;;
+        txt|log)                  printf 'text' ;;
+        *)                        printf 'text' ;;
+    esac
+}
+
+# Return a backtick fence longer than any run of backticks in the file.
+fence_for() {
+    local file="$1" fence='```'
+    while grep -qF -- "$fence" "$file" 2>/dev/null; do
+        fence="${fence}\`"
+    done
+    printf '%s' "$fence"
+}
+
+# Wrap text in an inline code span, choosing a delimiter that survives any
+# backticks inside the text.
+inline_code() {
+    local text="$1" ticks='`'
+    while [[ "$text" == *"$ticks"* ]]; do
+        ticks="${ticks}\`"
+    done
+    if (( ${#ticks} == 1 )); then
+        printf '`%s`' "$text"
+    else
+        printf '%s %s %s' "$ticks" "$text" "$ticks"
+    fi
+}
+
+# Escape a value for use in a Markdown table cell.
+md_cell() {
+    local text="$1"
+    text="${text//$'\n'/ }"
+    text="${text//|/\\|}"
+    printf '%s' "$text"
+}
+
+# Count Unicode characters (including newlines) in a file.
+count_chars() {
+    local file="$1" count
+    count="$(wc -m < "$file")"
+    count="${count//[[:space:]]/}"
+    printf '%s' "$count"
+}
+
+# English-prose estimate: roughly 4 characters per token.
+estimate_tokens() {
+    printf '%s' "$(( ($1 + 3) / 4 ))"
+}
+
+# Content.part1.md, Content.part2.md, ... (or name.part1 for extension-less paths).
+split_part_path() {
+    local base="$1" number="$2"
+    if [[ "$base" == *.* ]]; then
+        printf '%s.part%d.%s' "${base%.*}" "$number" "${base##*.}"
+    else
+        printf '%s.part%d' "$base" "$number"
+    fi
+}
+
+# Print the Markdown header. Called repeatedly while we converge on the exact
+# character count, so keep it deterministic.
+render_header() {
+    local chars="$1" tokens="$2"
+    printf '# Code export\n\n'
+    printf 'Repository: %s  \n' "$(inline_code "$ROOT_DIR")"
+    printf 'Files: %d  \n' "$included"
+    if (( SPLIT_CHARS > 0 )); then
+        printf 'Part: %d of %d  \n' "$CURRENT_PART" "$TOTAL_PARTS"
+        printf 'Part limit: ~%d characters  \n' "$SPLIT_CHARS"
+    fi
+    if [[ -n "$MODE_DESC" ]]; then
+        printf 'Mode: %s  \n' "$MODE_DESC"
+    fi
+    if [[ -n "$SELECTION_DESC" ]]; then
+        printf 'Selection: %s  \n' "$SELECTION_DESC"
+    fi
+    if [[ -n "$DIFF_DESC" ]]; then
+        printf 'Diff: %s  \n' "$DIFF_DESC"
+    fi
+    if (( BUDGET_TOKENS > 0 )); then
+        printf 'Budget: ~%s tokens (used ~%s)  \n' "$BUDGET_TOKENS" "$budget_used"
+    fi
+    if (( PROFILE_LLM )); then
+        printf 'Profile: llm  \n'
+    fi
+    printf 'Characters: %s  \n' "$chars"
+    printf 'Estimated tokens: ~%s (English prose, ~4 characters/token)  \n' "$tokens"
+    printf 'Generated by %s.\n\n' "$(inline_code "$SELF_NAME")"
+    printf -- '---\n\n'
+}
+
+# Render the unified diff section. The fence grows if the diff itself contains
+# backtick runs.
+render_diff_section() {
+    local base="$1" fence
+    printf '## Diff vs %s\n\n' "$(inline_code "$base")"
+    if [[ -s "$TMP_DIFF" ]]; then
+        fence="$(fence_for "$TMP_DIFF")"
+        printf '%sdiff\n' "$fence"
+        cat -- "$TMP_DIFF"
+        if [[ -n "$(tail -c 1 -- "$TMP_DIFF")" ]]; then
+            printf '\n'
+        fi
+        printf '%s\n\n' "$fence"
+    else
+        printf '_No changes._\n\n'
+    fi
+}
+
+# Write one output part with its own header. The header reports only that
+# part's character count, which is what matters for a context window.
+write_part() {
+    local chunk="$1" part_no="$2" total="$3" out="$4"
+    local chars tokens actual
+
+    CURRENT_PART="$part_no"
+    TOTAL_PARTS="$total"
+    chars="$(count_chars "$chunk")"
+    for _attempt in 1 2 3 4 5 6 7 8; do
+        tokens="$(estimate_tokens "$chars")"
+        {
+            if (( WRITE_HEADER )); then
+                render_header "$chars" "$tokens"
+            fi
+            cat -- "$chunk"
+        } > "$out" || die "cannot write output part '$out'"
+
+        actual="$(count_chars "$out")"
+        if (( actual == chars )); then
+            break
+        fi
+        chars="$actual"
+    done
+
+    PART_LAST_CHARS="$(count_chars "$out")"
+    PART_LAST_TOKENS="$(estimate_tokens "$PART_LAST_CHARS")"
+}
+
+# Split body text into fenced, line-based chunks. When a split lands inside a
+# fenced code block, the fence is closed at the end of the part and reopened
+# at the start of the next one.
+split_content() {
+    local source="$1" limit="$2"
+    local chunk_file="" chunk_chars=0 line line_len stripped run="" needs_split
+    local in_fence=0 fence_run=""
+
+    CHUNK_CHARS=()
+    SPLIT_CHUNKS=()
+
+    start_chunk() {
+        chunk_file="$(mktemp -- "${TMPDIR:-/tmp}/codemd-chunk.XXXXXX")" ||
+            die "cannot create temporary chunk file"
+        SPLIT_CHUNKS+=("$chunk_file")
+        chunk_chars=0
+        if (( in_fence )); then
+            printf '%s\n' "$fence_run" >> "$chunk_file"
+            chunk_chars=$(( ${#fence_run} + 1 ))
+        fi
+    }
+
+    finish_chunk() {
+        if (( in_fence )); then
+            printf '%s\n' "$fence_run" >> "$chunk_file"
+            chunk_chars=$(( chunk_chars + ${#fence_run} + 1 ))
+        fi
+        chunk_chars="$(count_chars "$chunk_file")"
+        CHUNK_CHARS+=("$chunk_chars")
+    }
+
+    start_chunk
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line_len=$(( ${#line} + 1 ))
+        needs_split=0
+
+        # Prefer breaking before the next file section once the current part
+        # is at least half full, but never inside a fenced code block. This
+        # keeps whole files together without wasting half of every part.
+        if (( ! in_fence )) && [[ "$line" == '## `'* ]] && (( chunk_chars * 2 >= limit )); then
+            needs_split=1
+        fi
+        if (( chunk_chars + line_len > limit )); then
+            needs_split=1
+        fi
+        if (( needs_split )) && (( chunk_chars > 0 )); then
+            finish_chunk
+            start_chunk
+        fi
+
+        printf '%s\n' "$line" >> "$chunk_file"
+        chunk_chars=$(( chunk_chars + line_len ))
+
+        # Track fenced code blocks so splits can continue them cleanly.
+        if [[ "$line" == '`'* ]]; then
+            stripped="$line"
+            run=""
+            while [[ "${stripped:0:1}" == '`' ]]; do
+                run+='`'
+                stripped="${stripped:1}"
+            done
+            if (( ${#run} >= 3 )); then
+                stripped="${line%"${line##*[![:space:]]}"}"
+                if (( ! in_fence )); then
+                    in_fence=1
+                    fence_run="$run"
+                elif [[ "$stripped" == "$fence_run" ]]; then
+                    in_fence=0
+                    fence_run=""
+                fi
+            fi
+        fi
+    done < "$source"
+    finish_chunk
+}
+
+# ---------------------------------------------------------------------------
+# Scratch files
+# ---------------------------------------------------------------------------
+TMP_BODY="$(mktemp -- "${TMPDIR:-/tmp}/codemd-body.XXXXXX")" || die "cannot create temporary file"
+TMP_EXCLUDED="$(mktemp -- "${TMPDIR:-/tmp}/codemd-excluded.XXXXXX")" || die "cannot create temporary file"
+TMP_CONTENT="$(mktemp -- "${TMPDIR:-/tmp}/codemd-content.XXXXXX")" || die "cannot create temporary file"
+TMP_FINAL="$(mktemp -- "${TMPDIR:-/tmp}/codemd-final.XXXXXX")" || die "cannot create temporary file"
+TMP_DIFF="$(mktemp -- "${TMPDIR:-/tmp}/codemd-diff.XXXXXX")" || die "cannot create temporary file"
+cleanup() {
+    rm -f -- "$TMP_BODY" "$TMP_EXCLUDED" "$TMP_CONTENT" "$TMP_FINAL" "$TMP_DIFF"
+    if (( ${#SPLIT_CHUNKS[@]} > 0 )); then
+        rm -f -- "${SPLIT_CHUNKS[@]}"
+    fi
+}
+trap cleanup EXIT INT TERM
+
+included=0
+budget_used=0
+budget_skipped=0
+
+record_excluded() {
+    local path="$1" reason="$2"
+    printf '%s\t%s\n' "$reason" "$path" >> "$TMP_EXCLUDED"
+    if (( PRINT_FILES )); then
+        printf ' [-] %s (%s)\n' "$path" "$reason"
+    fi
+}
+
+printf 'Scanning repository from root: %s\n' "$ROOT_DIR"
+printf -- '---------------------------------------------------------\n'
+
+# ---------------------------------------------------------------------------
+# Selection: full repository by default. --files/--glob/--changed narrow the
+# scan; --diff replaces it with a unified diff. None of this runs by default.
+# ---------------------------------------------------------------------------
+PARTIAL_SELECTION=0
+FILES_TO_SCAN=("${ALL_FILES[@]}")
+declare -A EXPLICIT_FILES=()
+
+if (( CHANGED_ONLY )); then
+    PARTIAL_SELECTION=1
+    git rev-parse --verify --quiet "${CHANGED_BASE}^{commit}" >/dev/null 2>&1 ||
+        die "--changed base '$CHANGED_BASE' is not a valid commit"
+    mapfile -d '' -t CHANGED_FILES < <(
+        git diff --no-renames --name-only -z --diff-filter=ACMRT "$CHANGED_BASE"
+    )
+    mapfile -d '' -t DELETED_FILES < <(
+        git diff --no-renames --name-only -z --diff-filter=D "$CHANGED_BASE"
+    )
+    mapfile -d '' -t UNTRACKED_FILES < <(
+        git ls-files -z --others --exclude-standard
+    )
+    declare -A selected=()
+    for changed in "${CHANGED_FILES[@]}" "${UNTRACKED_FILES[@]}"; do
+        [[ -n "$changed" && -f "$changed" ]] || continue
+        selected["$changed"]=1
+    done
+    FILES_TO_SCAN=()
+    if (( ${#selected[@]} > 0 )); then
+        mapfile -d '' -t FILES_TO_SCAN < <(printf '%s\0' "${!selected[@]}" | sort -z)
+    fi
+    SELECTION_DESC="changed since $(inline_code "$CHANGED_BASE") (${#FILES_TO_SCAN[@]} file(s))"
+fi
+
+if (( ${#FILES_PATTERNS[@]} > 0 || ${#GLOB_PATTERNS[@]} > 0 )); then
+    PARTIAL_SELECTION=1
+    declare -A selected=()
+
+    for arg in "${FILES_PATTERNS[@]}"; do
+        arg="${arg#./}"
+        if [[ -d "$arg" ]]; then
+            while IFS= read -r -d '' selected_file; do
+                selected["$selected_file"]=1
+            done < <(git ls-files -z --cached --others --exclude-standard -- "$arg")
+        elif [[ -f "$arg" ]]; then
+            # An explicit file wins over .gitignore, but never over -e or the
+            # binary/text checks in the main scan.
+            selected["$arg"]=1
+            EXPLICIT_FILES["$arg"]=1
+        elif [[ "$arg" == *[\*\?\[]* ]]; then
+            matched_any=0
+            for candidate in "${ALL_FILES[@]}"; do
+                if [[ "$candidate" == $arg ]]; then
+                    selected["$candidate"]=1
+                    matched_any=1
+                fi
+            done
+            (( matched_any )) || printf 'codemd: warning: --files pattern matched nothing: %s\n' "$arg" >&2
+        else
+            printf 'codemd: warning: --files path matched nothing: %s\n' "$arg" >&2
+        fi
+    done
+
+    for pattern in "${GLOB_PATTERNS[@]}"; do
+        matched_any=0
+        for candidate in "${ALL_FILES[@]}"; do
+            if [[ "$candidate" == $pattern ]]; then
+                selected["$candidate"]=1
+                matched_any=1
+            fi
+        done
+        (( matched_any )) || printf 'codemd: warning: --glob pattern matched nothing: %s\n' "$pattern" >&2
+    done
+
+    FILES_TO_SCAN=()
+    if (( ${#selected[@]} > 0 )); then
+        mapfile -d '' -t FILES_TO_SCAN < <(printf '%s\0' "${!selected[@]}" | sort -z)
+    fi
+
+    if (( ${#FILES_PATTERNS[@]} > 0 && ${#GLOB_PATTERNS[@]} > 0 )); then
+        SELECTION_DESC="--files/--glob filters (${#FILES_TO_SCAN[@]} file(s))"
+    elif (( ${#FILES_PATTERNS[@]} > 0 )); then
+        SELECTION_DESC="--files (${#FILES_TO_SCAN[@]} file(s))"
+    else
+        SELECTION_DESC="--glob (${#FILES_TO_SCAN[@]} file(s))"
+    fi
+fi
+
+# --changed reports removed files separately; they cannot be exported.
+if (( CHANGED_ONLY )); then
+    for deleted in "${DELETED_FILES[@]}"; do
+        [[ -n "$deleted" ]] || continue
+        record_excluded "$deleted" "deleted since $CHANGED_BASE"
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# Optional unified diff. --diff writes only this section; --with-diff adds it
+# to a normal export.
+# ---------------------------------------------------------------------------
+ACTIVE_DIFF_BASE=""
+diff_count=0
+if (( DIFF_ONLY || WITH_DIFF )); then
+    if (( DIFF_ONLY )); then
+        ACTIVE_DIFF_BASE="$DIFF_BASE"
+    else
+        ACTIVE_DIFF_BASE="$WITH_DIFF_BASE"
+    fi
+    git rev-parse --verify --quiet "${ACTIVE_DIFF_BASE}^{commit}" >/dev/null 2>&1 ||
+        die "diff base '$ACTIVE_DIFF_BASE' is not a valid commit"
+
+    mapfile -d '' -t DIFF_NAMES < <(
+        git diff --no-renames --name-only -z "$ACTIVE_DIFF_BASE"
+    )
+    mapfile -d '' -t DIFF_UNTRACKED < <(
+        git ls-files -z --others --exclude-standard
+    )
+    declare -A diff_seen=()
+    declare -A diff_untracked=()
+    for changed in "${DIFF_NAMES[@]}" "${DIFF_UNTRACKED[@]}"; do
+        [[ -n "$changed" ]] || continue
+        diff_seen["$changed"]=1
+    done
+    for untracked in "${DIFF_UNTRACKED[@]}"; do
+        [[ -n "$untracked" ]] && diff_untracked["$untracked"]=1
+    done
+
+    mapfile -d '' -t DIFF_PATHS < <(printf '%s\0' "${!diff_seen[@]}" | sort -z)
+    diff_count=0
+    for path in "${DIFF_PATHS[@]}"; do
+        [[ -n "$OUTPUT_REL" && "$path" == "$OUTPUT_REL" ]] && continue
+        [[ -n "$REPORT_REL" && "$path" == "$REPORT_REL" ]] && continue
+        [[ -n "$SELF_REL" && "$path" == "$SELF_REL" ]] && continue
+
+        if matched="$(extra_ignore_match "$path")"; then
+            if (( DIFF_ONLY )); then
+                record_path "$path" "extra ignore pattern '$matched'"
+            fi
+            continue
+        fi
+        if (( PROFILE_LLM )); then
+            if profile_reason="$(profile_skip_reason "$path")"; then
+                if (( DIFF_ONLY )); then
+                    record_path "$path" "$profile_reason"
+                fi
+                continue
+            fi
+        fi
+
+        if [[ -n "${diff_untracked[$path]:-}" ]]; then
+            [[ -f "$path" ]] || continue
+            # --no-index exits 1 when the files differ; that is not an error here.
+            git diff --no-index --no-ext-diff --unified=3 -- /dev/null "$path" >> "$TMP_DIFF" || true
+        else
+            git diff --no-ext-diff --no-renames --unified=3 "$ACTIVE_DIFF_BASE" -- "$path" >> "$TMP_DIFF" ||
+                die "cannot generate diff for '$path'"
+        fi
+        ((diff_count++))
+    done
+
+    DIFF_DESC="vs $(inline_code "$ACTIVE_DIFF_BASE") (${diff_count} file(s))"
+fi
+
+if (( DIFF_ONLY )); then
+    PARTIAL_SELECTION=1
+    included="$diff_count"
+    MODE_DESC="unified diff only"
+fi
+if (( MANIFEST )); then
+    MODE_DESC="file manifest (no code)"
+fi
+
+# ---------------------------------------------------------------------------
+# First: collect ignored paths reported by Git. Partial selections skip this:
+# the report should describe the selected scope, not the whole repository.
+# ---------------------------------------------------------------------------
+if (( ! PARTIAL_SELECTION )); then
+for entry in "${GIT_IGNORED[@]}"; do
+    clean="${entry%/}"
+
+    if [[ -n "$OUTPUT_REL" && "$clean" == "$OUTPUT_REL" ]]; then
+        record_excluded "$entry" "generated output file"
+        continue
+    fi
+    if [[ -n "$REPORT_REL" && "$clean" == "$REPORT_REL" ]]; then
+        record_excluded "$entry" "generated report file"
+        continue
+    fi
+    if [[ -n "$SELF_REL" && "$clean" == "$SELF_REL" ]]; then
+        record_excluded "$entry" "the $SELF_NAME script itself"
+        continue
+    fi
+
+    reason="ignored by .gitignore"
+    if matched="$(extra_ignore_match "$clean")"; then
+        reason+=" + extra ignore pattern '$matched'"
+    fi
+
+    if [[ "$entry" == */ ]]; then
+        # Always collapse dependency/build output.
+        if (( ! EXPAND_IGNORED )) && is_noise_name "$(basename -- "$clean")"; then
+            record_noise_dir "$clean" "$reason"
+            continue
+        fi
+
+        # Non-noise ignored directory: list its real files by name. Very
+        # large directories are summarized unless --expand-ignored is used.
+        mapfile -d '' -t NESTED_FILES < <(
+            git ls-files -z --others --ignored --exclude-standard -- "$clean"
+        )
+        if (( ! EXPAND_IGNORED )) && (( MAX_LIST > 0 )) && (( ${#NESTED_FILES[@]} > MAX_LIST )); then
+            record_excluded "$clean/" "$reason [directory, ${#NESTED_FILES[@]} files]"
+            continue
+        fi
+        if (( ${#NESTED_FILES[@]} == 0 )); then
+            record_excluded "$entry" "$reason [empty directory]"
+            continue
+        fi
+        for nested in "${NESTED_FILES[@]}"; do
+            record_path "$nested" "$reason"
+        done
+    else
+        record_path "$entry" "$reason"
+    fi
+done
+fi
+
+# ---------------------------------------------------------------------------
+# Second: scan the exportable files.
+# ---------------------------------------------------------------------------
+if (( ! DIFF_ONLY )); then
+if (( MANIFEST )); then
+    printf '## File manifest\n\n' >> "$TMP_BODY"
+    printf '| File | Language | Lines | Characters | ~Tokens |\n' >> "$TMP_BODY"
+    printf '| --- | --- | ---: | ---: | ---: |\n' >> "$TMP_BODY"
+fi
+declare -A DIR_FILES=()
+declare -A DIR_CHARS=()
+
+for file in "${FILES_TO_SCAN[@]}"; do
+    if [[ -n "$OUTPUT_REL" && "$file" == "$OUTPUT_REL" ]]; then
+        record_excluded "$file" "generated output file"
+        continue
+    fi
+
+    if [[ -n "$REPORT_REL" && "$file" == "$REPORT_REL" ]]; then
+        record_excluded "$file" "generated report file"
+        continue
+    fi
+
+    if [[ -n "$SELF_REL" && "$file" == "$SELF_REL" ]]; then
+        record_excluded "$file" "the $SELF_NAME script itself"
+        continue
+    fi
+
+    if matched="$(extra_ignore_match "$file")"; then
+        record_path "$file" "extra ignore pattern '$matched'"
+        continue
+    fi
+
+    if [[ ! -f "$file" ]]; then
+        record_path "$file" "not a regular file"
+        continue
+    fi
+
+    if [[ ! -r "$file" ]]; then
+        record_path "$file" "unreadable file"
+        continue
+    fi
+
+    if ! is_text_file "$file"; then
+        record_path "$file" "binary or non-text file"
+        continue
+    fi
+
+    # --profile llm is a convenience filter. Explicit --files selections win.
+    if (( PROFILE_LLM )) && [[ -z "${EXPLICIT_FILES[$file]:-}" ]]; then
+        if profile_reason="$(profile_skip_reason "$file")"; then
+            record_path "$file" "$profile_reason"
+            continue
+        fi
+    fi
+
+    if (( BUDGET_TOKENS > 0 )); then
+        file_chars="$(wc -m < "$file")"
+        file_chars="${file_chars//[[:space:]]/}"
+        file_tokens=$(( (file_chars + 3) / 4 + (${#file} + 32) / 4 ))
+        if (( budget_used + file_tokens > BUDGET_TOKENS )); then
+            remaining=$(( BUDGET_TOKENS > budget_used ? BUDGET_TOKENS - budget_used : 0 ))
+            record_path "$file" "over --budget (~${file_tokens} tokens needed, ~${remaining} left)"
+            ((budget_skipped++))
+            continue
+        fi
+        budget_used=$((budget_used + file_tokens))
+    fi
+
+    if (( MANIFEST )); then
+        lines="$(wc -l < "$file")"
+        lines="${lines//[[:space:]]/}"
+        file_chars="$(wc -m < "$file")"
+        file_chars="${file_chars//[[:space:]]/}"
+        file_tokens="$(estimate_tokens "$file_chars")"
+        printf '| %s | %s | %s | %s | ~%s |\n' \
+            "$(md_cell "$(inline_code "$file")")" \
+            "$(language_for "$file")" "$lines" "$file_chars" "$file_tokens" >> "$TMP_BODY"
+
+        directory="$(dirname -- "$file")"
+        DIR_FILES["$directory"]=$(( ${DIR_FILES["$directory"]:-0} + 1 ))
+        DIR_CHARS["$directory"]=$(( ${DIR_CHARS["$directory"]:-0} + file_chars ))
+
+        ((included++))
+        continue
+    fi
+
+    if (( PRINT_FILES )); then
+        printf ' [+] %s\n' "$file"
+    fi
+
+    lang="$(language_for "$file")"
+    fence="$(fence_for "$file")"
+    {
+        printf '## %s\n\n' "$(inline_code "$file")"
+        printf '%s%s\n' "$fence" "$lang"
+        cat -- "$file"
+        # Ensure the closing fence starts on its own line.
+        if [[ -s "$file" && -n "$(tail -c 1 -- "$file")" ]]; then
+            printf '\n'
+        fi
+        printf '%s\n\n' "$fence"
+    } >> "$TMP_BODY"
+
+    ((included++))
+done
+fi
+
+if (( MANIFEST )) && (( ${#DIR_CHARS[@]} > 0 )); then
+    printf '\n## Directories\n\n' >> "$TMP_BODY"
+    printf '| Directory | Files | Characters | ~Tokens |\n' >> "$TMP_BODY"
+    printf '| --- | ---: | ---: | ---: |\n' >> "$TMP_BODY"
+    {
+        for directory in "${!DIR_CHARS[@]}"; do
+            printf '%s\t%s\t%s\n' "${DIR_CHARS[$directory]}" "${DIR_FILES[$directory]}" "$directory"
+        done
+    } | sort -t $'\t' -k1,1nr | while IFS=$'\t' read -r dir_chars dir_files directory; do
+        printf '| %s | %s | %s | ~%s |\n' \
+            "$(md_cell "$(inline_code "$directory")")" \
+            "$dir_files" "$dir_chars" "$(estimate_tokens "$dir_chars")"
+    done >> "$TMP_BODY"
+    printf '\n' >> "$TMP_BODY"
+fi
+
+excluded_count="$(wc -l < "$TMP_EXCLUDED")"
+excluded_count="${excluded_count//[[:space:]]/}"
+
+# ---------------------------------------------------------------------------
+# Assemble the final Markdown file.
+#
+# The header contains the character/token totals, so build the content first,
+# then rewrite the header until the reported count matches the real file.
+# ---------------------------------------------------------------------------
+{
+    if (( DIFF_ONLY || WITH_DIFF )); then
+        render_diff_section "$ACTIVE_DIFF_BASE"
+    fi
+
+    if (( ! DIFF_ONLY )); then
+        cat -- "$TMP_BODY"
+    fi
+
+    if (( WRITE_EXCLUDED_SECTION )) && [[ -z "$REPORT_ABS" ]] && (( excluded_count > 0 )); then
+        printf -- '---\n\n'
+        printf '## Excluded files\n\n'
+        printf 'These paths were not exported (%d total):\n\n' "$excluded_count"
+        printf '| File | Reason |\n'
+        printf '| --- | --- |\n'
+        while IFS=$'\t' read -r reason path; do
+            printf '| %s | %s |\n' "$(md_cell "$(inline_code "$path")")" "$(md_cell "$reason")"
+        done < <(sort -t $'\t' -k2,2 -- "$TMP_EXCLUDED")
+        printf '\n'
+    fi
+} > "$TMP_CONTENT" || die "cannot write temporary content file"
+
+if (( SPLIT_CHARS == 0 )); then
+    # Original single-file behaviour.
+    total_chars="$(count_chars "$TMP_CONTENT")"
+    total_tokens="$(estimate_tokens "$total_chars")"
+
+    if (( WRITE_HEADER )); then
+        for _attempt in 1 2 3 4 5 6 7 8; do
+            total_tokens="$(estimate_tokens "$total_chars")"
+            {
+                render_header "$total_chars" "$total_tokens"
+                cat -- "$TMP_CONTENT"
+            } > "$TMP_FINAL" || die "cannot write temporary output file"
+
+            actual_chars="$(count_chars "$TMP_FINAL")"
+            if (( actual_chars == total_chars )); then
+                break
+            fi
+            total_chars="$actual_chars"
+        done
+    else
+        cp -- "$TMP_CONTENT" "$TMP_FINAL" || die "cannot write temporary output file"
+    fi
+
+    total_chars="$(count_chars "$TMP_FINAL")"
+    total_tokens="$(estimate_tokens "$total_chars")"
+    cat -- "$TMP_FINAL" > "$OUTPUT_ABS" || die "cannot write output file '$OUTPUT_ABS'"
+
+    PART_PATHS=("$OUTPUT_ABS")
+    PART_CHARS=("$total_chars")
+    PART_TOKENS=("$total_tokens")
+    TOTAL_PARTS=1
+    CURRENT_PART=1
+else
+    # Split mode. Reserve room for the header so each part stays under the
+    # requested character limit, including its own header.
+    TOTAL_PARTS=1
+    CURRENT_PART=1
+    render_header 0 0 > "$TMP_FINAL" || die "cannot measure header"
+    header_chars="$(count_chars "$TMP_FINAL")"
+    body_limit=$(( SPLIT_CHARS - header_chars - 100 ))
+    (( body_limit > 100 )) ||
+        die "--split-chars $SPLIT_CHARS is too small for the header (need >$(( header_chars + 100 )))"
+
+    split_content "$TMP_CONTENT" "$body_limit"
+    TOTAL_PARTS=${#SPLIT_CHUNKS[@]}
+
+    PART_PATHS=()
+    PART_CHARS=()
+    PART_TOKENS=()
+    total_chars=0
+    total_tokens=0
+    part_dir="$(dirname -- "$OUTPUT_ABS")"
+    output_base="$(basename -- "$OUTPUT_FILE")"
+
+    for (( part_no = 1; part_no <= TOTAL_PARTS; part_no++ )); do
+        part_name="$(split_part_path "$output_base" "$part_no")"
+        part_path="$part_dir/$part_name"
+        write_part "${SPLIT_CHUNKS[$(( part_no - 1 ))]}" "$part_no" "$TOTAL_PARTS" "$part_path"
+
+        part_chars="$PART_LAST_CHARS"
+        part_tokens="$PART_LAST_TOKENS"
+        if (( part_chars > SPLIT_CHARS )); then
+            printf 'codemd: warning: part %d is %d chars (limit %d)\n' \
+                "$part_no" "$part_chars" "$SPLIT_CHARS" >&2
+        fi
+        PART_PATHS+=("$part_path")
+        PART_CHARS+=("$part_chars")
+        PART_TOKENS+=("$part_tokens")
+        total_chars=$(( total_chars + part_chars ))
+        total_tokens=$(( total_tokens + part_tokens ))
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# Optional sidecar report. This keeps the exclusion table out of the payload,
+# which matters when the payload is going into an LLM context window.
+# ---------------------------------------------------------------------------
+if [[ -n "$REPORT_ABS" ]]; then
+    {
+        printf '# Excluded files\n\n'
+        printf 'Repository: %s  \n' "$(inline_code "$ROOT_DIR")"
+        if (( SPLIT_CHARS > 0 )); then
+            printf 'Parts: %d  \n' "${#PART_PATHS[@]}"
+            for (( i = 0; i < ${#PART_PATHS[@]}; i++ )); do
+                printf 'Part %d: %s (%s chars, ~%s tokens)  \n' \
+                    "$(( i + 1 ))" "$(inline_code "${PART_PATHS[$i]}")" \
+                    "${PART_CHARS[$i]}" "${PART_TOKENS[$i]}"
+            done
+        else
+            printf 'Export: %s  \n' "$(inline_code "$OUTPUT_ABS")"
+        fi
+        printf 'Files exported: %d  \n' "$included"
+        printf 'Characters: %s  \n' "$total_chars"
+        printf 'Estimated tokens: ~%s (English prose, ~4 characters/token)  \n' "$total_tokens"
+        printf 'Generated by %s.\n\n' "$(inline_code "$SELF_NAME")"
+
+        if (( excluded_count > 0 )); then
+            printf 'These paths were not exported (%d total):\n\n' "$excluded_count"
+            printf '| File | Reason |\n'
+            printf '| --- | --- |\n'
+            while IFS=$'\t' read -r reason path; do
+                printf '| %s | %s |\n' "$(md_cell "$(inline_code "$path")")" "$(md_cell "$reason")"
+            done < <(sort -t $'\t' -k2,2 -- "$TMP_EXCLUDED")
+            printf '\n'
+        else
+            printf 'No paths were excluded.\n'
+        fi
+    } > "$REPORT_ABS" || die "cannot write report file '$REPORT_ABS'"
+fi
+
+# ---------------------------------------------------------------------------
+# Experimental: render each text part into one or more PNG images.
+# ---------------------------------------------------------------------------
+IMAGE_LOG=""
+if (( TO_IMAGES )); then
+    image_args=()
+    if [[ -n "$IMAGE_OUTDIR" ]]; then
+        image_args+=(--outdir "$IMAGE_OUTDIR")
+    fi
+    if ! IMAGE_LOG="$(python3 "$DEFAULT_ROOT/codemd_images.py" \
+        "${PART_PATHS[@]}" \
+        --width "$IMAGE_WIDTH" \
+        --height "$IMAGE_HEIGHT" \
+        --font-size "$IMAGE_FONT_SIZE" \
+        --theme "$IMAGE_THEME" \
+        "${image_args[@]}" 2>&1)"; then
+        printf '%s\n' "$IMAGE_LOG" >&2
+        die "failed to render images"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Console summary
+# ---------------------------------------------------------------------------
+printf -- '---------------------------------------------------------\n'
+if (( SPLIT_CHARS > 0 )); then
+    printf 'Done! Wrote %d file(s) across %d part(s)\n' "$included" "${#PART_PATHS[@]}"
+    for (( i = 0; i < ${#PART_PATHS[@]}; i++ )); do
+        printf 'Part %d: %s (%s chars, ~%s tokens)\n' \
+            "$(( i + 1 ))" "${PART_PATHS[$i]}" "${PART_CHARS[$i]}" "${PART_TOKENS[$i]}"
+    done
+else
+    printf 'Done! Wrote %d file(s) to %s\n' "$included" "$OUTPUT_ABS"
+fi
+printf 'Total characters: %s\n' "$total_chars"
+printf 'Estimated tokens: ~%s (English prose, ~4 characters/token)\n' "$total_tokens"
+if (( TO_IMAGES )); then
+    printf '%s\n' "$IMAGE_LOG"
+fi
+if [[ -n "$REPORT_ABS" ]]; then
+    printf 'Report: %s\n' "$REPORT_ABS"
+fi
+if (( BUDGET_TOKENS > 0 )); then
+    printf 'Budget: ~%s tokens (used ~%s, skipped %d file(s))\n' \
+        "$BUDGET_TOKENS" "$budget_used" "$budget_skipped"
+fi
+if (( DIFF_ONLY )); then
+    printf 'Diff: vs %s (%d file(s))\n' "$ACTIVE_DIFF_BASE" "$diff_count"
+fi
+
+if (( excluded_count > 0 )); then
+    printf '%d path(s) excluded:\n' "$excluded_count"
+    while read -r count reason; do
+        printf '  %5s  %s\n' "$count" "$reason"
+    done < <(cut -f1 -- "$TMP_EXCLUDED" | sort | uniq -c | sort -k2)
+fi
+
+if (( included == 0 )) && (( ! DIFF_ONLY )); then
+    printf 'Warning: no files were exported.\n' >&2
+    exit 1
+fi
+
+exit 0
