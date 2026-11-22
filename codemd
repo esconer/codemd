@@ -38,8 +38,13 @@ DIFF_ONLY=0
 WITH_DIFF=0
 CHANGED_ONLY=0
 DIFF_BASE="HEAD"
+DIFF_REVS=("HEAD")
 CHANGED_BASE="HEAD"
+CHANGED_REVS=("HEAD")
 WITH_DIFF_BASE="HEAD"
+WITH_DIFF_REVS=("HEAD")
+COMMITS_ONLY=0
+COMMITS_RANGE="HEAD~1..HEAD"
 BUDGET_TOKENS=0
 SPLIT_CHARS=0
 TO_IMAGES=0
@@ -143,9 +148,11 @@ Selection and LLM helpers (opt-in; the default full export is unchanged):
       --manifest          Write a file manifest (no code) instead of an export
       --files PATH        Export only PATH (repeatable; exact files bypass .gitignore)
       --glob PATTERN      Export only files matching PATTERN (repeatable)
-      --changed [BASE]    Export only files changed vs BASE (default: HEAD)
-      --diff [BASE]       Export only a unified diff vs BASE (default: HEAD)
-      --with-diff [BASE]  Add a unified diff vs BASE to a full export
+      --changed [A [B]]   Export only files changed vs A, or between A and B
+      --diff [A [B]]      Export only a unified diff vs A, A..B, or A B
+      --with-diff [A [B]] Add a unified diff vs A, A..B, or A B to a full export
+      --commits [RANGE]   Write commits as Markdown with messages and diffs
+      --pr [BASE]         Like --commits with BASE..HEAD (default base: main)
       --budget N          Skip files that would exceed ~N estimated tokens
       --split-chars N     Split output into ~N-character parts (part1, part2, ...)
       --to-images         Render parts to PNG images (experimental; needs Pillow)
@@ -169,6 +176,10 @@ Examples:
   $SELF_NAME --include-ignored
   $SELF_NAME --changed
   $SELF_NAME --diff HEAD~1
+  $SELF_NAME --diff HEAD~3..HEAD
+  $SELF_NAME --diff abc123 def456
+  $SELF_NAME --commits HEAD~5..HEAD
+  $SELF_NAME --pr main -o PR.md
   $SELF_NAME --files crates/protocol/src/wire.rs --files crates/host-engine/src/lib.rs
   $SELF_NAME --glob 'crates/protocol/*' --budget 64000
   $SELF_NAME --split-chars 100000 --report Content.report.md
@@ -260,32 +271,75 @@ while (( $# > 0 )); do
             ;;
         --changed|--changed=*)
             if [[ "$1" == *=* ]]; then
-                CHANGED_BASE="${1#*=}"
+                CHANGED_REVS=("${1#*=}")
             elif (( $# >= 2 )) && [[ "$2" != -* ]]; then
-                CHANGED_BASE="$2"
+                CHANGED_REVS=("$2")
                 shift
+                if (( $# >= 2 )) && [[ "$2" != -* ]]; then
+                    CHANGED_REVS+=("$2")
+                    shift
+                fi
+            else
+                CHANGED_REVS=("HEAD")
             fi
+            CHANGED_BASE="${CHANGED_REVS[0]}"
             CHANGED_ONLY=1
             shift
             ;;
         --diff|--diff=*)
             if [[ "$1" == *=* ]]; then
-                DIFF_BASE="${1#*=}"
+                DIFF_REVS=("${1#*=}")
             elif (( $# >= 2 )) && [[ "$2" != -* ]]; then
-                DIFF_BASE="$2"
+                DIFF_REVS=("$2")
                 shift
+                if (( $# >= 2 )) && [[ "$2" != -* ]]; then
+                    DIFF_REVS+=("$2")
+                    shift
+                fi
+            else
+                DIFF_REVS=("HEAD")
             fi
+            DIFF_BASE="${DIFF_REVS[0]}"
             DIFF_ONLY=1
             shift
             ;;
         --with-diff|--with-diff=*)
             if [[ "$1" == *=* ]]; then
-                WITH_DIFF_BASE="${1#*=}"
+                WITH_DIFF_REVS=("${1#*=}")
             elif (( $# >= 2 )) && [[ "$2" != -* ]]; then
-                WITH_DIFF_BASE="$2"
+                WITH_DIFF_REVS=("$2")
+                shift
+                if (( $# >= 2 )) && [[ "$2" != -* ]]; then
+                    WITH_DIFF_REVS+=("$2")
+                    shift
+                fi
+            else
+                WITH_DIFF_REVS=("HEAD")
+            fi
+            WITH_DIFF_BASE="${WITH_DIFF_REVS[0]}"
+            WITH_DIFF=1
+            shift
+            ;;
+        --commits|--commits=*)
+            if [[ "$1" == *=* ]]; then
+                COMMITS_RANGE="${1#*=}"
+            elif (( $# >= 2 )) && [[ "$2" != -* ]]; then
+                COMMITS_RANGE="$2"
                 shift
             fi
-            WITH_DIFF=1
+            COMMITS_ONLY=1
+            shift
+            ;;
+        --pr|--pr=*)
+            if [[ "$1" == *=* ]]; then
+                COMMITS_RANGE="${1#*=}..HEAD"
+            elif (( $# >= 2 )) && [[ "$2" != -* ]]; then
+                COMMITS_RANGE="$2..HEAD"
+                shift
+            else
+                COMMITS_RANGE="main..HEAD"
+            fi
+            COMMITS_ONLY=1
             shift
             ;;
         --budget)
@@ -377,7 +431,16 @@ done
 [[ -n "$DIFF_BASE" ]] || die "--diff base cannot be empty"
 [[ -n "$CHANGED_BASE" ]] || die "--changed base cannot be empty"
 [[ -n "$WITH_DIFF_BASE" ]] || die "--with-diff base cannot be empty"
+[[ -n "$COMMITS_RANGE" ]] || die "--commits range cannot be empty"
+[[ ${#DIFF_REVS[@]} -gt 0 ]] || die "--diff needs at least one revision"
+[[ ${#CHANGED_REVS[@]} -gt 0 ]] || die "--changed needs at least one revision"
+[[ ${#WITH_DIFF_REVS[@]} -gt 0 ]] || die "--with-diff needs at least one revision"
 
+if (( COMMITS_ONLY )); then
+    (( ! DIFF_ONLY && ! WITH_DIFF && ! CHANGED_ONLY )) ||
+        die "--commits/--pr cannot be combined with --diff/--changed/--with-diff"
+    (( ! MANIFEST )) || die "--commits/--pr cannot be combined with --manifest"
+fi
 if (( MANIFEST )); then
     (( ! DIFF_ONLY && ! WITH_DIFF )) || die "--manifest cannot be combined with --diff/--with-diff"
     (( BUDGET_TOKENS == 0 )) || die "--manifest does not use --budget"
@@ -787,7 +850,11 @@ render_header() {
     local chars="$1" tokens="$2"
     printf '# Code export\n\n'
     printf 'Repository: %s  \n' "$(inline_code "$ROOT_DIR")"
-    printf 'Files: %d  \n' "$included"
+    if (( COMMITS_ONLY )); then
+        printf 'Commits: %d  \n' "$included"
+    else
+        printf 'Files: %d  \n' "$included"
+    fi
     if (( SPLIT_CHARS > 0 )); then
         printf 'Part: %d of %d  \n' "$CURRENT_PART" "$TOTAL_PARTS"
         printf 'Part limit: ~%d characters  \n' "$SPLIT_CHARS"
@@ -977,17 +1044,36 @@ declare -A EXPLICIT_FILES=()
 
 if (( CHANGED_ONLY )); then
     PARTIAL_SELECTION=1
-    git rev-parse --verify --quiet "${CHANGED_BASE}^{commit}" >/dev/null 2>&1 ||
-        die "--changed base '$CHANGED_BASE' is not a valid commit"
+    CHANGED_LABEL="${CHANGED_REVS[*]}"
+    CHANGED_IS_RANGE=0
+    (( ${#CHANGED_REVS[@]} == 2 )) && CHANGED_IS_RANGE=1
+    if (( ${#CHANGED_REVS[@]} == 1 )) && [[ "${CHANGED_REVS[0]}" == *".."* ]]; then
+        CHANGED_IS_RANGE=1
+    fi
+
+    for rev in "${CHANGED_REVS[@]}"; do
+        [[ -n "$rev" ]] || die "--changed revision cannot be empty"
+        if [[ "$rev" == *".."* ]]; then
+            git rev-list --max-count=1 --quiet "$rev" >/dev/null 2>&1 ||
+                die "invalid revision range '$rev'"
+        else
+            git rev-parse --verify --quiet "${rev}^{commit}" >/dev/null 2>&1 ||
+                die "--changed revision '$rev' is not a valid commit"
+        fi
+    done
+
     mapfile -d '' -t CHANGED_FILES < <(
-        git diff --no-renames --name-only -z --diff-filter=ACMRT "$CHANGED_BASE"
+        git diff --no-renames --name-only -z --diff-filter=ACMRT "${CHANGED_REVS[@]}"
     )
     mapfile -d '' -t DELETED_FILES < <(
-        git diff --no-renames --name-only -z --diff-filter=D "$CHANGED_BASE"
+        git diff --no-renames --name-only -z --diff-filter=D "${CHANGED_REVS[@]}"
     )
-    mapfile -d '' -t UNTRACKED_FILES < <(
-        git ls-files -z --others --exclude-standard
-    )
+    UNTRACKED_FILES=()
+    if (( ! CHANGED_IS_RANGE )); then
+        mapfile -d '' -t UNTRACKED_FILES < <(
+            git ls-files -z --others --exclude-standard
+        )
+    fi
     declare -A selected=()
     for changed in "${CHANGED_FILES[@]}" "${UNTRACKED_FILES[@]}"; do
         [[ -n "$changed" && -f "$changed" ]] || continue
@@ -997,7 +1083,7 @@ if (( CHANGED_ONLY )); then
     if (( ${#selected[@]} > 0 )); then
         mapfile -d '' -t FILES_TO_SCAN < <(printf '%s\0' "${!selected[@]}" | sort -z)
     fi
-    SELECTION_DESC="changed since $(inline_code "$CHANGED_BASE") (${#FILES_TO_SCAN[@]} file(s))"
+    SELECTION_DESC="changed in $(inline_code "$CHANGED_LABEL") (${#FILES_TO_SCAN[@]} file(s))"
 fi
 
 if (( ${#FILES_PATTERNS[@]} > 0 || ${#GLOB_PATTERNS[@]} > 0 )); then
@@ -1058,7 +1144,7 @@ fi
 if (( CHANGED_ONLY )); then
     for deleted in "${DELETED_FILES[@]}"; do
         [[ -n "$deleted" ]] || continue
-        record_excluded "$deleted" "deleted since $CHANGED_BASE"
+        record_excluded "$deleted" "deleted in $CHANGED_LABEL"
     done
 fi
 
@@ -1066,23 +1152,45 @@ fi
 # Optional unified diff. --diff writes only this section; --with-diff adds it
 # to a normal export.
 # ---------------------------------------------------------------------------
-ACTIVE_DIFF_BASE=""
+ACTIVE_DIFF_REVS=()
+DIFF_LABEL=""
+DIFF_IS_RANGE=0
 diff_count=0
 if (( DIFF_ONLY || WITH_DIFF )); then
     if (( DIFF_ONLY )); then
-        ACTIVE_DIFF_BASE="$DIFF_BASE"
+        ACTIVE_DIFF_REVS=("${DIFF_REVS[@]}")
     else
-        ACTIVE_DIFF_BASE="$WITH_DIFF_BASE"
+        ACTIVE_DIFF_REVS=("${WITH_DIFF_REVS[@]}")
     fi
-    git rev-parse --verify --quiet "${ACTIVE_DIFF_BASE}^{commit}" >/dev/null 2>&1 ||
-        die "diff base '$ACTIVE_DIFF_BASE' is not a valid commit"
+    DIFF_LABEL="${ACTIVE_DIFF_REVS[*]}"
+
+    # Two commits, or a spec containing "..", means we compare committed
+    # states; untracked working-tree files must not leak into that diff.
+    (( ${#ACTIVE_DIFF_REVS[@]} == 2 )) && DIFF_IS_RANGE=1
+    if (( ${#ACTIVE_DIFF_REVS[@]} == 1 )) && [[ "${ACTIVE_DIFF_REVS[0]}" == *".."* ]]; then
+        DIFF_IS_RANGE=1
+    fi
+
+    for rev in "${ACTIVE_DIFF_REVS[@]}"; do
+        [[ -n "$rev" ]] || die "diff revision cannot be empty"
+        if [[ "$rev" == *".."* ]]; then
+            git rev-list --max-count=1 --quiet "$rev" >/dev/null 2>&1 ||
+                die "invalid revision range '$rev'"
+        else
+            git rev-parse --verify --quiet "${rev}^{commit}" >/dev/null 2>&1 ||
+                die "diff revision '$rev' is not a valid commit"
+        fi
+    done
 
     mapfile -d '' -t DIFF_NAMES < <(
-        git diff --no-renames --name-only -z "$ACTIVE_DIFF_BASE"
+        git diff --no-renames --name-only -z "${ACTIVE_DIFF_REVS[@]}"
     )
-    mapfile -d '' -t DIFF_UNTRACKED < <(
-        git ls-files -z --others --exclude-standard
-    )
+    DIFF_UNTRACKED=()
+    if (( ! DIFF_IS_RANGE )); then
+        mapfile -d '' -t DIFF_UNTRACKED < <(
+            git ls-files -z --others --exclude-standard
+        )
+    fi
     declare -A diff_seen=()
     declare -A diff_untracked=()
     for changed in "${DIFF_NAMES[@]}" "${DIFF_UNTRACKED[@]}"; do
@@ -1120,13 +1228,13 @@ if (( DIFF_ONLY || WITH_DIFF )); then
             # --no-index exits 1 when the files differ; that is not an error here.
             git diff --no-index --no-ext-diff --unified=3 -- /dev/null "$path" >> "$TMP_DIFF" || true
         else
-            git diff --no-ext-diff --no-renames --unified=3 "$ACTIVE_DIFF_BASE" -- "$path" >> "$TMP_DIFF" ||
+            git diff --no-ext-diff --no-renames --unified=3 "${ACTIVE_DIFF_REVS[@]}" -- "$path" >> "$TMP_DIFF" ||
                 die "cannot generate diff for '$path'"
         fi
         ((diff_count++))
     done
 
-    DIFF_DESC="vs $(inline_code "$ACTIVE_DIFF_BASE") (${diff_count} file(s))"
+    DIFF_DESC="vs $(inline_code "$DIFF_LABEL") (${diff_count} file(s))"
 fi
 
 if (( DIFF_ONLY )); then
@@ -1136,6 +1244,71 @@ if (( DIFF_ONLY )); then
 fi
 if (( MANIFEST )); then
     MODE_DESC="file manifest (no code)"
+fi
+
+# ---------------------------------------------------------------------------
+# Commit / PR history as Markdown: commit metadata plus per-commit diffs.
+# ---------------------------------------------------------------------------
+if (( COMMITS_ONLY )); then
+    PARTIAL_SELECTION=1
+    MODE_DESC="commit history"
+    SELECTION_DESC="commits in $(inline_code "$COMMITS_RANGE")"
+
+    if [[ "$COMMITS_RANGE" == *".."* ]]; then
+        git rev-list --max-count=1 --quiet "$COMMITS_RANGE" >/dev/null 2>&1 ||
+            die "invalid commit range '$COMMITS_RANGE'"
+    else
+        git rev-parse --verify --quiet "${COMMITS_RANGE}^{commit}" >/dev/null 2>&1 ||
+            die "commit '$COMMITS_RANGE' is not a valid commit"
+    fi
+
+    commit_fields=()
+    commit_count=0
+    while IFS= read -r -d '' field; do
+        commit_fields+=("$field")
+        if (( ${#commit_fields[@]} >= 7 )); then
+            c_hash="${commit_fields[0]}"
+            c_short="${commit_fields[1]}"
+            c_author="${commit_fields[2]}"
+            c_email="${commit_fields[3]}"
+            c_date="${commit_fields[4]}"
+            c_subject="${commit_fields[5]}"
+            c_body="${commit_fields[6]}"
+            commit_fields=()
+
+            {
+                printf '## Commit %s %s\n\n' "$c_short" "$c_subject"
+                printf 'Hash: `%s`  \n' "$c_hash"
+                printf 'Author: %s <%s>  \n' "$c_author" "$c_email"
+                printf 'Date: %s  \n\n' "$c_date"
+                if [[ -n "$c_body" ]]; then
+                    printf '%s\n\n' "$c_body"
+                fi
+            } >> "$TMP_BODY"
+
+            git show --format= --no-ext-diff --no-renames --unified=3 "$c_hash" > "$TMP_DIFF" ||
+                die "cannot generate diff for commit '$c_hash'"
+            if [[ -s "$TMP_DIFF" ]]; then
+                commit_fence="$(fence_for "$TMP_DIFF")"
+                {
+                    printf '%sdiff\n' "$commit_fence"
+                    cat -- "$TMP_DIFF"
+                    if [[ -n "$(tail -c 1 -- "$TMP_DIFF")" ]]; then
+                        printf '\n'
+                    fi
+                    printf '%s\n\n' "$commit_fence"
+                } >> "$TMP_BODY"
+            else
+                printf '_No file changes._\n\n' >> "$TMP_BODY"
+            fi
+            ((commit_count++))
+        fi
+    done < <(git log --reverse -z --format='%H%x00%h%x00%an%x00%ae%x00%aI%x00%s%x00%b' "$COMMITS_RANGE")
+
+    if (( commit_count == 0 )); then
+        printf '_No commits in range._\n\n' >> "$TMP_BODY"
+    fi
+    included="$commit_count"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1196,7 +1369,7 @@ fi
 # ---------------------------------------------------------------------------
 # Second: scan the exportable files.
 # ---------------------------------------------------------------------------
-if (( ! DIFF_ONLY )); then
+if (( ! DIFF_ONLY && ! COMMITS_ONLY )); then
 if (( MANIFEST )); then
     printf '## File manifest\n\n' >> "$TMP_BODY"
     printf '| File | Language | Lines | Characters | ~Tokens |\n' >> "$TMP_BODY"
@@ -1328,7 +1501,7 @@ excluded_count="${excluded_count//[[:space:]]/}"
 # ---------------------------------------------------------------------------
 {
     if (( DIFF_ONLY || WITH_DIFF )); then
-        render_diff_section "$ACTIVE_DIFF_BASE"
+        render_diff_section "$DIFF_LABEL"
     fi
 
     if (( ! DIFF_ONLY )); then
@@ -1483,7 +1656,9 @@ fi
 # Console summary
 # ---------------------------------------------------------------------------
 printf -- '---------------------------------------------------------\n'
-if (( SPLIT_CHARS > 0 )); then
+if (( COMMITS_ONLY )); then
+    printf 'Done! Wrote %d commit(s) to %s\n' "$included" "$OUTPUT_ABS"
+elif (( SPLIT_CHARS > 0 )); then
     printf 'Done! Wrote %d file(s) across %d part(s)\n' "$included" "${#PART_PATHS[@]}"
     for (( i = 0; i < ${#PART_PATHS[@]}; i++ )); do
         printf 'Part %d: %s (%s chars, ~%s tokens)\n' \
@@ -1505,7 +1680,10 @@ if (( BUDGET_TOKENS > 0 )); then
         "$BUDGET_TOKENS" "$budget_used" "$budget_skipped"
 fi
 if (( DIFF_ONLY )); then
-    printf 'Diff: vs %s (%d file(s))\n' "$ACTIVE_DIFF_BASE" "$diff_count"
+    printf 'Diff: vs %s (%d file(s))\n' "$DIFF_LABEL" "$diff_count"
+fi
+if (( COMMITS_ONLY )); then
+    printf 'Commits: %d in %s\n' "$commit_count" "$COMMITS_RANGE"
 fi
 
 if (( excluded_count > 0 )); then
@@ -1515,7 +1693,7 @@ if (( excluded_count > 0 )); then
     done < <(cut -f1 -- "$TMP_EXCLUDED" | sort | uniq -c | sort -k2)
 fi
 
-if (( included == 0 )) && (( ! DIFF_ONLY )); then
+if (( included == 0 )) && (( ! DIFF_ONLY )) && (( ! COMMITS_ONLY )); then
     printf 'Warning: no files were exported.\n' >&2
     exit 1
 fi

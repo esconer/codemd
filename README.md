@@ -51,9 +51,11 @@ containing file count, character count, estimated tokens, and an
     --manifest          Write a file manifest (no code)
     --files PATH        Export only PATH (repeatable; exact files bypass .gitignore)
     --glob PATTERN      Export only files matching PATTERN (repeatable)
-    --changed [BASE]    Export only files changed vs BASE (default HEAD)
-    --diff [BASE]       Export only a unified diff vs BASE (default HEAD)
-    --with-diff [BASE]  Add a unified diff vs BASE to a full export
+    --changed [A [B]]   Export only files changed vs A, or between A and B
+    --diff [A [B]]      Export only a unified diff vs A, A..B, or A B
+    --with-diff [A [B]] Add a unified diff vs A, A..B, or A B to a full export
+    --commits [RANGE]   Write commits as Markdown with messages and diffs
+    --pr [BASE]         Like --commits with BASE..HEAD (default base: main)
     --budget N          Skip files that would exceed ~N estimated tokens
     --profile llm       Skip lockfiles, licenses, wrappers, generated assets
     --report FILE       Write exclusion report to FILE (omitted from payload)
@@ -80,6 +82,20 @@ After applying patches locally (send only what changed):
 
 ```bash
 ./codemd -C /path/to/repo --diff --report /path/to/repo/Content.report.md
+```
+
+Diff between two commits (or a range):
+
+```bash
+./codemd -C /path/to/repo --diff abc123 def456 -o DIFF.md
+./codemd -C /path/to/repo --diff HEAD~5..HEAD -o DIFF.md
+```
+
+Commit history / PR as Markdown:
+
+```bash
+./codemd -C /path/to/repo --commits HEAD~5..HEAD -o HISTORY.md
+./codemd -C /path/to/repo --pr main -o PR.md
 ```
 
 Repo map only (~1–2k tokens):
