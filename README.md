@@ -70,6 +70,19 @@ containing file count, character count, estimated tokens, and an
 
 Run `./codemd --help` for the full list and examples.
 
+### Split naming
+
+With `--split-chars N`:
+
+- Files that fit within the budget are **never split** across parts.
+- Only a file larger than the budget is split; those parts are named
+  `Content.part7-src__lib.rs-1of3.md`, `Content.part8-src__lib.rs-2of3.md`, etc.
+- Ordinary parts keep `Content.part1.md`.
+- `Content.parts.md` is written alongside the parts and maps every part to the
+  files (and file pieces) it contains.
+- If one source line is longer than the budget (minified code, long JSON), it
+  is wrapped at character boundaries so no part exceeds the limit.
+
 ## Workflow examples
 
 Initial full review:

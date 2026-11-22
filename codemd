@@ -59,6 +59,9 @@ SPLIT_CHUNKS=()
 PART_PATHS=()
 PART_CHARS=()
 PART_TOKENS=()
+PART_DESCS=()
+PARTS_INDEX=""
+declare -A PART_TOTAL_MAP=()
 FILES_PATTERNS=()
 GLOB_PATTERNS=()
 DELETED_FILES=()
@@ -154,7 +157,7 @@ Selection and LLM helpers (opt-in; the default full export is unchanged):
       --commits [RANGE]   Write commits as Markdown with messages and diffs
       --pr [BASE]         Like --commits with BASE..HEAD (default base: main)
       --budget N          Skip files that would exceed ~N estimated tokens
-      --split-chars N     Split output into ~N-character parts (part1, part2, ...)
+      --split-chars N     Split into ~N-char parts; keep whole files intact when possible
       --to-images         Render parts to PNG images (experimental; needs Pillow)
       --image-width PX    Image width in pixels (default: 1800)
       --image-height PX   Image height in pixels (default: 4096)
@@ -844,6 +847,39 @@ split_part_path() {
     fi
 }
 
+# Turn a split descriptor into a short filename tag and a readable description.
+# Tokens are "F<TAB>path" (whole section) or "P<TAB>path<TAB>piece".
+describe_part() {
+    local desc="$1" token kind path piece tag=""
+    local description=""
+    local -a tokens=()
+    local sep=$'\036'
+
+    PART_TAG=""
+    PART_DESCRIPTION=""
+    [[ -n "$desc" ]] || return 0
+
+    IFS="$sep" read -r -a tokens <<< "$desc"
+    for token in "${tokens[@]}"; do
+        IFS=$'\t' read -r kind path piece <<< "$token"
+        [[ -n "$path" ]] || continue
+        if [[ "$kind" == "P" ]]; then
+            local clean="${path//\//__}"
+            clean="${clean// /_}"
+            clean="${clean//[^A-Za-z0-9._-]/_}"
+            if [[ -z "$tag" ]]; then
+                tag="${clean}-${piece}of${PART_TOTAL_MAP[$path]:-$piece}"
+            fi
+            description+="$(inline_code "$path") (part $piece of ${PART_TOTAL_MAP[$path]:-$piece}); "
+        else
+            description+="$(inline_code "$path"); "
+        fi
+    done
+
+    PART_TAG="$tag"
+    PART_DESCRIPTION="${description%; }"
+}
+
 # Print the Markdown header. Called repeatedly while we converge on the exact
 # character count, so keep it deterministic.
 render_header() {
@@ -927,15 +963,66 @@ write_part() {
     PART_LAST_TOKENS="$(estimate_tokens "$PART_LAST_CHARS")"
 }
 
-# Split body text into fenced, line-based chunks. When a split lands inside a
-# fenced code block, the fence is closed at the end of the part and reopened
-# at the start of the next one.
+# Split body text into chunks. A file section that fits within the budget is
+# never split; only a section larger than the budget is split, and the split
+# pieces are recorded so their part names can say "part 1 of file N".
+# Fences are closed/reopened at split boundaries so every part stays valid.
 split_content() {
     local source="$1" limit="$2"
     local chunk_file="" chunk_chars=0 line line_len stripped run="" needs_split
     local in_fence=0 fence_run=""
+    local line_no=0 is_heading=0 sec_len=0 name="" joined=""
+    local start=-1 clen=0 cname="" i token remaining piece max_piece
+    local current_tokens=() token_sep=$'\036'
+    local split_at_heading=0
+    local CONTENT_LINES=()
+    local -A SEC_LEN=()
+    local -A SEC_NAME=()
+    local active_split_path="" active_split_piece=1 section_oversized=0
+
+    clean_heading() {
+        local text="${1#\#\# }"
+        text="${text//\`/}"
+        text="${text#"${text%%[![:space:]]*}"}"
+        text="${text%"${text##*[![:space:]]}"}"
+        printf '%s' "$text"
+    }
+
+    join_tokens() {
+        local out="" tok
+        for tok in "${current_tokens[@]}"; do
+            out+="${out:+$token_sep}$tok"
+        done
+        printf '%s' "$out"
+    }
+
+    # First pass: read lines and measure each file section.
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        CONTENT_LINES+=("$line")
+    done < "$source"
+
+    for (( i = 0; i < ${#CONTENT_LINES[@]}; i++ )); do
+        line="${CONTENT_LINES[$i]}"
+        line_len=$(( ${#line} + 1 ))
+        if [[ "$line" == '## `'* || "$line" == '## Excluded files' ]]; then
+            if (( start >= 0 )); then
+                SEC_LEN[$start]="$clen"
+                SEC_NAME[$start]="$cname"
+            fi
+            start=$(( i + 1 ))
+            clen="$line_len"
+            cname="$(clean_heading "$line")"
+        else
+            clen=$(( clen + line_len ))
+        fi
+    done
+    if (( start >= 0 )); then
+        SEC_LEN[$start]="$clen"
+        SEC_NAME[$start]="$cname"
+    fi
 
     CHUNK_CHARS=()
+    CHUNK_TOKENS=()
     SPLIT_CHUNKS=()
 
     start_chunk() {
@@ -952,35 +1039,93 @@ split_content() {
     finish_chunk() {
         if (( in_fence )); then
             printf '%s\n' "$fence_run" >> "$chunk_file"
-            chunk_chars=$(( chunk_chars + ${#fence_run} + 1 ))
         fi
         chunk_chars="$(count_chars "$chunk_file")"
         CHUNK_CHARS+=("$chunk_chars")
+        CHUNK_TOKENS+=("$(join_tokens)")
+        current_tokens=()
+
+        # A split inside an oversized section means the next part continues
+        # that same file.
+        if (( section_oversized )) && (( ! split_at_heading )); then
+            active_split_piece=$(( active_split_piece + 1 ))
+            current_tokens+=("P"$'\t'"$active_split_path"$'\t'"$active_split_piece")
+        fi
+        split_at_heading=0
     }
 
     start_chunk
-    while IFS= read -r line || [[ -n "$line" ]]; do
+    for line in "${CONTENT_LINES[@]}"; do
+        ((line_no++))
         line_len=$(( ${#line} + 1 ))
         needs_split=0
+        is_heading=0
 
-        # Prefer breaking before the next file section once the current part
-        # is at least half full, but never inside a fenced code block. This
-        # keeps whole files together without wasting half of every part.
-        if (( ! in_fence )) && [[ "$line" == '## `'* ]] && (( chunk_chars * 2 >= limit )); then
-            needs_split=1
+        if [[ "$line" == '## `'* || "$line" == '## Excluded files' ]]; then
+            is_heading=1
+            name="$(clean_heading "$line")"
+            sec_len="${SEC_LEN[$line_no]:-$line_len}"
+            if (( chunk_chars > 0 )); then
+                # An oversized file starts a fresh part. A file that fits is
+                # moved whole to the next part instead of being cut.
+                if (( sec_len > limit )); then
+                    needs_split=1
+                elif (( chunk_chars + sec_len > limit )); then
+                    needs_split=1
+                fi
+            fi
         fi
         if (( chunk_chars + line_len > limit )); then
             needs_split=1
         fi
         if (( needs_split )) && (( chunk_chars > 0 )); then
+            split_at_heading="$is_heading"
             finish_chunk
             start_chunk
         fi
 
-        printf '%s\n' "$line" >> "$chunk_file"
-        chunk_chars=$(( chunk_chars + line_len ))
+        if (( is_heading )); then
+            if (( sec_len > limit )); then
+                section_oversized=1
+                active_split_path="$name"
+                active_split_piece=1
+                current_tokens+=("P"$'\t'"$name"$'\t'"1")
+            else
+                section_oversized=0
+                active_split_path=""
+                current_tokens+=("F"$'\t'"$name")
+            fi
+        fi
 
-        # Track fenced code blocks so splits can continue them cleanly.
+        if (( line_len > limit )); then
+            # A single line longer than the budget (minified code, long JSON)
+            # is wrapped at character boundaries so the part stays under the
+            # limit. The source text is preserved in order.
+            remaining="$line"
+            max_piece=$(( limit - 1 ))
+            while (( ${#remaining} + 1 > limit )); do
+                piece="${remaining:0:max_piece}"
+                if (( chunk_chars + ${#piece} + 1 > limit )) && (( chunk_chars > 0 )); then
+                    split_at_heading=0
+                    finish_chunk
+                    start_chunk
+                fi
+                printf '%s\n' "$piece" >> "$chunk_file"
+                chunk_chars=$(( chunk_chars + ${#piece} + 1 ))
+                remaining="${remaining:max_piece}"
+            done
+            if (( chunk_chars + ${#remaining} + 1 > limit )) && (( chunk_chars > 0 )); then
+                split_at_heading=0
+                finish_chunk
+                start_chunk
+            fi
+            printf '%s\n' "$remaining" >> "$chunk_file"
+            chunk_chars=$(( chunk_chars + ${#remaining} + 1 ))
+        else
+            printf '%s\n' "$line" >> "$chunk_file"
+            chunk_chars=$(( chunk_chars + line_len ))
+        fi
+
         if [[ "$line" == '`'* ]]; then
             stripped="$line"
             run=""
@@ -999,7 +1144,8 @@ split_content() {
                 fi
             fi
         fi
-    done < "$source"
+    done
+    split_at_heading=1
     finish_chunk
 }
 
@@ -1567,16 +1713,38 @@ else
     split_content "$TMP_CONTENT" "$body_limit"
     TOTAL_PARTS=${#SPLIT_CHUNKS[@]}
 
+    # Work out how many parts each oversized file spans before naming parts.
+    PART_TOTAL_MAP=()
+    for desc_entry in "${CHUNK_TOKENS[@]}"; do
+        while IFS= read -r -d $'\036' desc_token || [[ -n "$desc_token" ]]; do
+            IFS=$'\t' read -r rev_kind rev_path rev_piece <<< "$desc_token"
+            if [[ "$rev_kind" == "P" && -n "$rev_path" ]]; then
+                if [[ -z "${PART_TOTAL_MAP[$rev_path]:-}" ]] || (( rev_piece > PART_TOTAL_MAP[$rev_path] )); then
+                    PART_TOTAL_MAP[$rev_path]="$rev_piece"
+                fi
+            fi
+        done < <(printf '%s\036' "$desc_entry")
+    done
+
     PART_PATHS=()
     PART_CHARS=()
     PART_TOKENS=()
+    PART_DESCS=()
     total_chars=0
     total_tokens=0
     part_dir="$(dirname -- "$OUTPUT_ABS")"
     output_base="$(basename -- "$OUTPUT_FILE")"
 
     for (( part_no = 1; part_no <= TOTAL_PARTS; part_no++ )); do
+        describe_part "${CHUNK_TOKENS[$(( part_no - 1 ))]:-}"
         part_name="$(split_part_path "$output_base" "$part_no")"
+        if [[ -n "$PART_TAG" ]]; then
+            if [[ "$part_name" == *.* ]]; then
+                part_name="${part_name%.*}-${PART_TAG}.${part_name##*.}"
+            else
+                part_name="${part_name}-${PART_TAG}"
+            fi
+        fi
         part_path="$part_dir/$part_name"
         write_part "${SPLIT_CHUNKS[$(( part_no - 1 ))]}" "$part_no" "$TOTAL_PARTS" "$part_path"
 
@@ -1589,9 +1757,27 @@ else
         PART_PATHS+=("$part_path")
         PART_CHARS+=("$part_chars")
         PART_TOKENS+=("$part_tokens")
+        PART_DESCS+=("$PART_DESCRIPTION")
         total_chars=$(( total_chars + part_chars ))
         total_tokens=$(( total_tokens + part_tokens ))
     done
+
+    # Sidecar index mapping each part to the files it contains.
+    parts_index="$part_dir/${output_base%.*}.parts.md"
+    {
+        printf '# Parts index\n\n'
+        printf 'Generated by %s from %s.\n\n' "$(inline_code "$SELF_NAME")" "$(inline_code "$ROOT_DIR")"
+        printf 'Files are kept whole whenever they fit. Oversized files are split and named `...-partN FILE-1ofM.md`. Very long single lines are wrapped.\n\n'
+        printf '| Part | Contains |\n'
+        printf '| --- | --- |\n'
+        for (( i = 0; i < ${#PART_PATHS[@]}; i++ )); do
+            printf '| %s | %s |\n' \
+                "$(md_cell "$(inline_code "$(basename -- "${PART_PATHS[$i]}")")")" \
+                "$(md_cell "${PART_DESCS[$i]}")"
+        done
+        printf '\n'
+    } > "$parts_index" || die "cannot write parts index '$parts_index'"
+    PARTS_INDEX="$parts_index"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1604,6 +1790,7 @@ if [[ -n "$REPORT_ABS" ]]; then
         printf 'Repository: %s  \n' "$(inline_code "$ROOT_DIR")"
         if (( SPLIT_CHARS > 0 )); then
             printf 'Parts: %d  \n' "${#PART_PATHS[@]}"
+            [[ -z "$PARTS_INDEX" ]] || printf 'Parts index: %s  \n' "$(inline_code "$PARTS_INDEX")"
             for (( i = 0; i < ${#PART_PATHS[@]}; i++ )); do
                 printf 'Part %d: %s (%s chars, ~%s tokens)  \n' \
                     "$(( i + 1 ))" "$(inline_code "${PART_PATHS[$i]}")" \
@@ -1674,6 +1861,9 @@ if (( TO_IMAGES )); then
 fi
 if [[ -n "$REPORT_ABS" ]]; then
     printf 'Report: %s\n' "$REPORT_ABS"
+fi
+if [[ -n "$PARTS_INDEX" ]]; then
+    printf 'Parts index: %s\n' "$PARTS_INDEX"
 fi
 if (( BUDGET_TOKENS > 0 )); then
     printf 'Budget: ~%s tokens (used ~%s, skipped %d file(s))\n' \
